@@ -125,13 +125,20 @@ end
 
 local Aerospace = {}; Aerospace.__index = Aerospace
 
+-- Track consecutive empty responses to detect stale sockets
+local EMPTY_RESPONSE_THRESHOLD = 3
+
 function Aerospace.new(path)
     if not path then
         local username = io.popen("id -un"):read("*l")
         path = DEFAULT.SOCK_FMT:format(username)
     end
 
-    return setmetatable({ sockPath = path, fd = connect(path) }, Aerospace)
+    return setmetatable({
+        sockPath = path,
+        fd = connect(path),
+        empty_response_count = 0,
+    }, Aerospace)
 end
 
 function Aerospace:close()
@@ -152,9 +159,19 @@ function Aerospace:is_initialized() return self.fd ~= nil end
 
 local PAYLOAD_TMPL = '{"command":"","args":%s,"stdin":""}\n'
 function Aerospace:_query(args, want_json, big)
+    -- Auto-reconnect if socket is not initialized
     if not self:is_initialized() then
-        log.error("query attempted but socket not initialized")
-        error(ERR.NOT_INIT)
+        log.warn("socket not initialized, attempting auto-reconnect")
+        local ok, err = pcall(function() self:reconnect() end)
+        if not ok then
+            log.error("auto-reconnect failed: %s", tostring(err))
+            error(ERR.NOT_INIT)
+        end
+        if not self:is_initialized() then
+            log.error("auto-reconnect succeeded but socket still not initialized")
+            error(ERR.NOT_INIT)
+        end
+        log.info("auto-reconnect successful, resuming query")
     end
 
     local cmd_name = args[1] or "unknown"
@@ -220,9 +237,25 @@ function Aerospace:_query(args, want_json, big)
 
     -- Validate we got data
     if raw == "" or raw:match("^%s*$") then
-        log.warn("empty response for: %s", cmd_name)
+        self.empty_response_count = self.empty_response_count + 1
+        log.warn("empty response for: %s (consecutive empty: %d/%d)",
+            cmd_name, self.empty_response_count, EMPTY_RESPONSE_THRESHOLD)
+
+        -- Detect stale socket: too many consecutive empty responses
+        if self.empty_response_count >= EMPTY_RESPONSE_THRESHOLD then
+            log.error("STALE SOCKET DETECTED: %d consecutive empty responses, reconnecting", self.empty_response_count)
+            self.empty_response_count = 0
+            self:reconnect()
+        end
+
         return want_json and {} or ""
     end
+
+    -- Reset counter on successful response
+    if self.empty_response_count > 0 then
+        log.info("socket recovered after %d empty responses", self.empty_response_count)
+    end
+    self.empty_response_count = 0
 
     local out = stdout(raw)
     return want_json and decode(out) or out
