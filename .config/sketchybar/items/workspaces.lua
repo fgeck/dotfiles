@@ -39,6 +39,10 @@ local nsscreen_to_display = {}
 local mapping_complete = false
 local log_file = "/tmp/sketchybar_workspaces.log"
 
+-- Debounce display_change events to prevent rapid-fire during monitor connect/disconnect
+local display_change_pending = false
+local DEBOUNCE_DELAY = 1.0  -- seconds
+
 local function log_mapping(msg)
     local f = io.open(log_file, "a")
     if f then
@@ -60,13 +64,15 @@ local function build_monitor_mapping()
         end
 
         local monitor_names_by_position = {}
+        local monitor_count = 0
         for line in monitors_output:gmatch("[^\r\n]+") do
             local position, name = line:match("(%d+)%s*|%s*(.+)")
             if position and name then
                 monitor_names_by_position[name:match("^%s*(.-)%s*$")] = tonumber(position)
+                monitor_count = monitor_count + 1
             end
         end
-        log.debug("build_monitor_mapping: found %d monitors", #monitor_names_by_position or 0)
+        log.debug("build_monitor_mapping: found %d monitors", monitor_count)
 
         -- Query workspaces to get NSScreen IDs and build the mapping
         local workspace_info = aerospace:query_workspaces()
@@ -259,6 +265,10 @@ local function updateWindow(workspace_index, args)
     -- Determine if this workspace is focused
     local is_focused = workspace_index == focused_workspace
 
+    -- Validate display ID to prevent crash on stale/invalid mappings
+    local target_display = workspace_monitors[workspace_index]
+    local display_valid = target_display and target_display > 0
+
     sbar.animate("tanh", 10.0, function()
         -- Check if this workspace is visible
         local is_visible = false
@@ -269,17 +279,22 @@ local function updateWindow(workspace_index, args)
             end
         end
 
+        -- Build base properties (without display if invalid)
+        local base_props = {
+            drawing = true,
+            icon = { highlight = is_focused },
+            label = {
+                string = icon_line,
+                highlight = is_focused
+            },
+        }
+        if display_valid then
+            base_props.display = target_display
+        end
+
         if no_app and is_visible then
-            icon_line = " —"
-            workspaces[workspace_index]:set({
-                drawing = true,
-                icon = { highlight = is_focused },
-                label = {
-                    string = icon_line,
-                    highlight = is_focused
-                },
-                display = workspace_monitors[workspace_index],
-            })
+            base_props.label.string = " —"
+            workspaces[workspace_index]:set(base_props)
             return
         end
 
@@ -291,28 +306,12 @@ local function updateWindow(workspace_index, args)
         end
 
         if no_app and workspace_index == focused_workspace then
-            icon_line = " —"
-            workspaces[workspace_index]:set({
-                drawing = true,
-                icon = { highlight = is_focused },
-                label = {
-                    string = icon_line,
-                    highlight = is_focused
-                },
-                display = workspace_monitors[workspace_index],
-            })
+            base_props.label.string = " —"
+            workspaces[workspace_index]:set(base_props)
             return
         end
 
-        workspaces[workspace_index]:set({
-            drawing = true,
-            icon = { highlight = is_focused },
-            label = {
-                string = icon_line,
-                highlight = is_focused
-            },
-            display = workspace_monitors[workspace_index],
-        })
+        workspaces[workspace_index]:set(base_props)
     end)
 end
 
@@ -326,15 +325,22 @@ end
 
 local function updateWorkspaceMonitor()
     aerospace:query_workspaces(function(workspace_info)
+        if not workspace_info or type(workspace_info) ~= "table" then
+            log.warn("updateWorkspaceMonitor: invalid workspace_info")
+            return
+        end
         for _, ws in ipairs(workspace_info) do
             local space_index = ws.workspace
-            local nsscreen_id = math.floor(ws["monitor-appkit-nsscreen-screens-id"])
-            local display_id = nsscreen_to_display[nsscreen_id] or nsscreen_id
-            -- print(string.format("[UPDATE_MONITOR] WS%s: NSScreen %d -> display %d", space_index, nsscreen_id, display_id))
-            if workspaces[space_index] then
-                workspaces[space_index]:set({
-                    display = display_id,
-                })
+            local nsscreen_id_raw = ws["monitor-appkit-nsscreen-screens-id"]
+            if nsscreen_id_raw then
+                local nsscreen_id = math.floor(nsscreen_id_raw)
+                local display_id = nsscreen_to_display[nsscreen_id] or nsscreen_id
+                -- Only set display if we have a valid mapping and workspace exists
+                if workspaces[space_index] and display_id and display_id > 0 then
+                    workspaces[space_index]:set({
+                        display = display_id,
+                    })
+                end
             end
         end
     end)
@@ -403,12 +409,33 @@ aerospace:query_workspaces(function(workspace_info)
     end))
 
     root:subscribe("display_change", safe_handler("display_change", function()
-        log.info("EVENT: display_change - rebuilding monitor mapping")
-        -- Rebuild the NSScreen to display mapping when monitors change
-        build_monitor_mapping()
-        updateWorkspaceMonitor()
-        updateWindows()
-        log.info("EVENT: display_change - completed")
+        -- Debounce: skip if a rebuild is already pending
+        if display_change_pending then
+            log.info("EVENT: display_change - debounced (already pending)")
+            return
+        end
+        display_change_pending = true
+        log.info("EVENT: display_change - scheduling rebuild in %ss", DEBOUNCE_DELAY)
+
+        sbar.exec("sleep " .. DEBOUNCE_DELAY, function()
+            display_change_pending = false
+            log.info("EVENT: display_change - executing rebuild")
+
+            -- Clear stale mappings before rebuild
+            nsscreen_to_display = {}
+            mapping_complete = false
+
+            build_monitor_mapping()
+
+            -- Only proceed if mapping succeeded
+            if mapping_complete then
+                updateWorkspaceMonitor()
+                updateWindows()
+            else
+                log.warn("EVENT: display_change - mapping failed, skipping updates")
+            end
+            log.info("EVENT: display_change - completed")
+        end)
     end))
 
     aerospace:list_current(function(focused_workspace)

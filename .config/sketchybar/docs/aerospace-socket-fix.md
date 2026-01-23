@@ -106,3 +106,45 @@ Debug logs are written to `/tmp/sketchybar_lua.log`. Look for:
 2. **Blocking reads without timeout can freeze the entire event loop** - Use `poll()` before `read()`
 3. **Process sampling (`sample` command on macOS) is invaluable** - Shows exactly where a process is stuck
 4. **`lsof -U` shows Unix socket relationships** - The `->0x...` shows which socket endpoints are connected
+
+---
+
+## Additional Issue: Mach IPC Deadlock (2026-01-16)
+
+**Symptom:** Sketchybar bar works (click events fire), but lua callbacks stop running. Clock freezes.
+
+**Trigger:** Wake from sleep, especially when connecting to dock with monitors.
+
+### Stack trace shows different issue
+
+```
+callback_function (in sketchybar.so) → sketchybar → mach_send_message → mach_msg2_trap
+```
+
+Both sketchybar and lua are waiting to send messages to each other - a **mach IPC deadlock**.
+
+### Analysis
+
+This is different from the socket issue. The sketchybar ↔ lua communication uses mach ports, and during sleep/wake with monitor changes, an event storm can cause:
+- sketchybar sends event to lua
+- lua callback tries to call `sbar.set()` or similar back to sketchybar
+- sketchybar is still waiting for lua to finish processing
+- Deadlock
+
+### Monitoring
+
+Event logging added to `items/workspaces.lua`:
+```lua
+log.debug("EVENT: aerospace_workspace_change")
+log.debug("EVENT: front_app_switched")
+log.debug("EVENT: display_change")
+```
+
+Check for event storms:
+```bash
+grep "EVENT:" /tmp/sketchybar_lua.log | tail -50
+```
+
+### Status
+
+Root cause still under investigation. May require debouncing display_change events or restructuring callbacks to avoid synchronous calls back to sketchybar during event handling.
