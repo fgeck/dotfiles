@@ -1,0 +1,10 @@
+theme = Catppuccin Mocha
+font-family = "MesloLGS Nerd Font Mono"
+cursor-style = block
+cursor-style-blink = true
+shell-integration-features = no-cursor,no-sudo
+mouse-hide-while-typing = true
+
+# Unbind Ctrl+D so it passes through to terminal apps (e.g., Neovim scroll)
+keybind = ctrl+d=unbind
+
